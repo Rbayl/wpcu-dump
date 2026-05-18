@@ -1,321 +1,381 @@
 #!/usr/bin/env python3
+"""
+ShadowDownloader v2.0
+WordPress Uploads Mass Downloader
+"""
+
+import argparse
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
 
 import requests
-import os
-import sys
-import argparse
-import time
-import json
-import re
-from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def format_size(size_bytes: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# Core downloader
+# ---------------------------------------------------------------------------
+
 class ShadowDownloader:
-    def __init__(self, base_url, output_dir=None, threads=10, timeout=30, user_agent=None):
-        self.base_url = base_url.rstrip('/')
-        if getattr(sys.modules['__main__'], 'SINGLE_TARGET_MODE', False):
-            # Kalau single target
-            if output_dir:
-                self.output_dir = output_dir
-            else:
-                self.output_dir = None
-        else:
-            self.output_dir = output_dir or self._create_output_dir()
+    # File extensions we care about
+    FILE_EXTENSIONS = (
+        "jpg", "jpeg", "png", "gif", "bmp", "webp",
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "zip", "rar", "7z", "tar", "gz",
+        "mp4", "mp3", "avi", "mov", "wmv", "flv",
+        "txt", "log", "csv", "json", "xml",
+        "sql", "backup", "bak",
+    )
+
+    # Single compiled pattern (case-insensitive, no redundancy)
+    _EXT_PATTERN = re.compile(
+        r'href=["\']([^"\']+\.(?:' +
+        "|".join(FILE_EXTENSIONS) +
+        r'))["\']',
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        output_dir: str | None = None,
+        threads: int = 10,
+        timeout: int = 30,
+        delay: float = 0.0,
+        user_agent: str | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
         self.threads = threads
         self.timeout = timeout
+        self.delay = delay          # seconds between requests (rate-limit courtesy)
+
+        # Thread-safe result tracking
+        self._lock = threading.Lock()
+        self.downloaded_files: list[dict] = []
+        self.failed_downloads: list[dict] = []
+
+        # Output directory (resolved lazily for single-file mode)
+        self._output_dir = output_dir
+
+        # Session
         self.session = requests.Session()
-        self.downloaded_files = []
-        self.failed_downloads = []
+        self.session.headers.update({
+            "User-Agent": user_agent or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": self.base_url,
+        })
 
-        self.headers = {
-            'User-Agent': user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': self.base_url
-        }
-        self.session.headers.update(self.headers)
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
-        # 🎯 Display
-        print("┌─────────────────────────────────────────────────────────┐")
-        print("│                WP Content Upload Download               │")
-        print("│                        by Rbayl                         │")
-        print("└─────────────────────────────────────────────────────────┘")
-        print(f"🔗 Target    : {self.base_url}")
-        if getattr(sys.modules['__main__'], 'SINGLE_TARGET_MODE', False):
-            if self.output_dir: 
-                print(f"📁 Output    : {self.output_dir}")
-        else:
-            print(f"📁 Output    : {self.output_dir}")
-        print(f"🔢 Threads   : {self.threads}")
-        print("─" * 60)
+    @property
+    def output_dir(self) -> str:
+        if self._output_dir is None:
+            domain = urlparse(self.base_url).netloc
+            self._output_dir = f"downloads_{domain}_{int(time.time())}"
+        return self._output_dir
 
-    def _create_output_dir(self):
-        domain = urlparse(self.base_url).netloc
-        timestamp = int(time.time())
-        output_dir = f"downloads_{domain}_{timestamp}"
-        return output_dir
+    # ------------------------------------------------------------------
+    # Internal network helpers
+    # ------------------------------------------------------------------
 
-    def _get_directory_listing(self, url):
+    def _get(self, url: str, stream: bool = False) -> requests.Response | None:
+        """GET with error handling and optional delay."""
         try:
-            response = self.session.get(url, timeout=self.timeout)
-            if response.status_code != 200:
-                return []
+            if self.delay:
+                time.sleep(self.delay)
+            return self.session.get(url, stream=stream, timeout=self.timeout)
+        except requests.RequestException as exc:
+            print(f"❌ GET failed [{url}]: {exc}")
+            return None
 
-            file_patterns = [
-                r'href="([^"]+\.(jpg|jpeg|png|gif|bmp|webp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|mp4|mp3|avi|mov|wmv|flv|txt|log|csv|json|xml|sql|backup|bak))"',
-                r'href="([^"]+\.(JPG|JPEG|PNG|GIF|BMP|WEBP|PDF|DOC|DOCX|XLS|XLSX|PPT|PPTX|ZIP|RAR|7Z|TAR|GZ|MP4|MP3|AVI|MOV|WMV|FLV|TXT|LOG|CSV|JSON|XML|SQL|BACKUP|BAK))"',
-                r"href='([^']+\.(jpg|jpeg|png|gif|bmp|webp|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|mp4|mp3|avi|mov|wmv|flv|txt|log|csv|json|xml|sql|backup|bak))'",
-                r'href="([^"]+\.[a-zA-Z0-9]{2,5})"',
-            ]
+    def _head(self, url: str) -> int:
+        """Return status code from HEAD request, or 0 on error."""
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            return self.session.head(url, timeout=self.timeout).status_code
+        except requests.RequestException:
+            return 0
 
-            files = []
-            for pattern in file_patterns:
-                matches = re.findall(pattern, response.text, re.IGNORECASE)
-                for match in matches:
-                    file_url = match[0] if isinstance(match, tuple) else match
-                    if (file_url not in ['../', './']
-                            and not file_url.startswith('?')
-                            and not file_url.endswith('/')):
-                        full_url = urljoin(url, file_url)
-                        files.append(full_url)
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
 
-            return list(set(files))
-
-        except requests.RequestException as e:
-            print(f"❌ Error accessing {url}: {e}")
+    def _parse_links(self, url: str) -> list[str]:
+        """Return absolute file URLs found in a directory listing page."""
+        resp = self._get(url)
+        if resp is None or resp.status_code != 200:
             return []
 
-    def _discover_directories(self, base_url):
-        print("🔍 Scanning directory structure...")
+        found = []
+        for match in self._EXT_PATTERN.finditer(resp.text):
+            href = match.group(1)
+            if href in ("../", "./") or href.startswith("?") or href.endswith("/"):
+                continue
+            full_url = urljoin(url, href)
+            found.append(full_url)
 
-        directories = [base_url]
-        discovered_dirs = set()
+        return list(dict.fromkeys(found))   # deduplicate, preserve order
 
-        common_dirs = ['2025', '2024', '2023', '2022', '2021', '2020',
-                       '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12']
+    def _discover_directories(self, base_url: str) -> list[str]:
+        """Probe common year/month sub-directories under *base_url*."""
+        print("🔍 Scanning year/month sub-directories...")
 
-        for year in common_dirs[:6]:
+        years  = [str(y) for y in range(2018, 2026)]
+        months = [f"{m:02d}" for m in range(1, 13)]
+
+        dirs: list[str] = []
+
+        for year in years:
             year_url = f"{base_url}/{year}/"
-            if self._check_directory_exists(year_url):
-                directories.append(year_url)
-                discovered_dirs.add(year_url)
-                print(f"├─ 📁 Found: /{year}/")
+            if self._head(year_url) == 200:
+                dirs.append(year_url)
+                print(f"  ├─ 📁 {year}/")
 
-                for month in common_dirs[6:]:
-                    month_url = f"{year_url}/{month}/"
-                    if self._check_directory_exists(month_url):
-                        directories.append(month_url)
-                        discovered_dirs.add(month_url)
-                        print(f"│  └─ 📂 Found: /{year}/{month}/")
+                for month in months:
+                    month_url = f"{year_url}{month}/"
+                    if self._head(month_url) == 200:
+                        dirs.append(month_url)
+                        print(f"  │  └─ 📂 {year}/{month}/")
 
-        print(f"└─ Scan completed")
-        return list(discovered_dirs)
+        print(f"  └─ Found {len(dirs)} sub-directories")
+        return dirs
 
-    def _check_directory_exists(self, url):
-        try:
-            response = self.session.head(url, timeout=self.timeout)
-            return response.status_code == 200
-        except:
-            return False
+    def discover_files(self) -> list[str]:
+        """Return every unique file URL reachable under self.base_url."""
+        print("\n🔍 Starting file discovery...")
 
-    def _download_file(self, file_url, local_path):
+        all_files: list[str] = []
+
+        # Base directory
+        base_files = self._parse_links(self.base_url)
+        all_files.extend(base_files)
+        print(f"  ├─ Base directory : {len(base_files)} file(s)")
+
+        # Year/month sub-directories
+        sub_dirs = self._discover_directories(self.base_url)
+        sub_total = 0
+        for d in sub_dirs:
+            files = self._parse_links(d)
+            all_files.extend(files)
+            sub_total += len(files)
+
+        if sub_total:
+            print(f"  ├─ Sub-directories: {sub_total} file(s)")
+
+        unique = list(dict.fromkeys(all_files))
+        print(f"  └─ Total unique   : {len(unique)} file(s)\n")
+        return unique
+
+    # ------------------------------------------------------------------
+    # Download
+    # ------------------------------------------------------------------
+
+    def _download_one(self, file_url: str, local_path: str) -> bool:
+        """Download a single file. Thread-safe."""
         try:
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-            response = self.session.get(file_url, stream=True, timeout=self.timeout)
-            response.raise_for_status()
+            resp = self._get(file_url, stream=True)
+            if resp is None:
+                raise RuntimeError("No response")
+            resp.raise_for_status()
 
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
+            with open(local_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:
-                        f.write(chunk)
+                        fh.write(chunk)
 
-            file_info = {
-                'url': file_url,
-                'local_path': local_path,
-                'size': os.path.getsize(local_path),
-                'timestamp': time.time()
-            }
-            self.downloaded_files.append(file_info)
+            size = os.path.getsize(local_path)
+            info = {"url": file_url, "local_path": local_path,
+                    "size": size, "timestamp": time.time()}
 
-            print(f"✅ {os.path.basename(local_path):<50} {self._format_size(file_info['size']):>10}")
+            with self._lock:
+                self.downloaded_files.append(info)
+
+            print(f"  ✅ {os.path.basename(local_path):<50} {format_size(size):>10}")
             return True
 
-        except Exception as e:
-            filename = os.path.basename(local_path)
-            print(f"❌ {filename:<50} {str(e)[:25]:<25}")
-            self.failed_downloads.append({'url': file_url, 'error': str(e)})
+        except Exception as exc:
+            with self._lock:
+                self.failed_downloads.append({"url": file_url, "error": str(exc)})
+            print(f"  ❌ {os.path.basename(local_path):<50} {str(exc)[:30]}")
             return False
 
-    def _format_size(self, size_bytes):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.1f} TB"
+    # ------------------------------------------------------------------
+    # Public entry-points
+    # ------------------------------------------------------------------
 
-    def discover_files(self, base_url):
-        print("🔍 Starting file discovery...")
-
-        all_files = []
-        base_files = self._get_directory_listing(base_url)
-        all_files.extend(base_files)
-        print(f"├─ Base directory: {len(base_files)} files")
-
-        directories = self._discover_directories(base_url)
-
-        total_dir_files = 0
-        for directory in directories:
-            dir_files = self._get_directory_listing(directory)
-            all_files.extend(dir_files)
-            if dir_files:
-                total_dir_files += len(dir_files)
-
-        if total_dir_files > 0:
-            print(f"├─ Subdirectories: {total_dir_files} files")
-
-        total_files = len(set(all_files))
-        print(f"└─ Total files: {total_files}")
-
-        return list(set(all_files))
-
-    def download_single_file(self, file_url, custom_filename=None):
-        print("🎯 SINGLE TARGET MODE")
-        print(f"🔗 URL: {file_url}")
-        print("─" * 60)
-
-        if getattr(sys.modules['__main__'], 'SINGLE_TARGET_MODE', False) and self.output_dir:
-            # Kalau user kasih -o, simpan di folder itu
-            if not os.path.exists(self.output_dir):
-                os.makedirs(self.output_dir, exist_ok=True)
-            base_dir = self.output_dir
-        else:
-            # Default: simpan di current working dir
-            base_dir = os.getcwd()
+    def download_single(self, file_url: str, custom_filename: str | None = None) -> bool:
+        """Download one file to the current directory (or self._output_dir if set)."""
+        base_dir = self._output_dir or os.getcwd()
+        os.makedirs(base_dir, exist_ok=True)
 
         if custom_filename:
             local_path = os.path.join(base_dir, custom_filename)
         else:
-            parsed_url = urlparse(file_url)
-            filename = os.path.basename(parsed_url.path)
-            if not filename or filename == '/':
-                filename = f"downloaded_file_{int(time.time())}"
+            filename = os.path.basename(urlparse(file_url).path) or \
+                       f"file_{int(time.time())}"
             local_path = os.path.join(base_dir, filename)
 
+        print(f"\n🎯 Single-file download")
+        print(f"   URL  : {file_url}")
+        print(f"   Save : {local_path}\n")
 
-        success = self._download_file(file_url, local_path)
+        success = self._download_one(file_url, local_path)
+        print(f"\n{'✅ Done' if success else '❌ Failed'}: {local_path}")
+        return success
 
-        print("─" * 60)
-        if success:
-            print(f"✅ DOWNLOAD COMPLETE: {local_path}")
-            return True
-        else:
-            print(f"❌ DOWNLOAD FAILED: {file_url}")
-            return False
+    def download_all(self) -> None:
+        """Discover and mass-download every file under self.base_url."""
+        files = self.discover_files()
 
-    def download_all_files(self):
-        print("🚀 MASS DOWNLOAD INITIATED")
-
-        all_files = self.discover_files(self.base_url)
-
-        if not all_files:
-            print("❌ No files found to download")
+        if not files:
+            print("❌ No files found.")
             return
 
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        print(f"📦 Total files to download: {len(all_files)}")
-        print("─" * 60)
+        # Build (url, local_path) pairs
+        tasks: list[tuple[str, str]] = []
+        for url in files:
+            rel = urlparse(url).path.split("/wp-content/uploads/", 1)[-1].lstrip("/")
+            local = os.path.join(self.output_dir, rel)
+            tasks.append((url, local))
 
-        download_tasks = []
-        for file_url in all_files:
-            parsed_url = urlparse(file_url)
-            relative_path = parsed_url.path.split('/wp-content/uploads/')[-1]
-            local_path = os.path.join(self.output_dir, relative_path.lstrip('/'))
-            download_tasks.append((file_url, local_path))
+        print(f"📦 {len(tasks)} file(s) queued  →  {self.output_dir}\n")
 
-        print("📥 Starting download process...")
-
-        successful_downloads = 0
+        ok_count = 0
         try:
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                futures = {executor.submit(self._download_file, url, path): (url, path)
-                           for url, path in download_tasks}
+            with ThreadPoolExecutor(max_workers=self.threads) as pool:
+                futures = {pool.submit(self._download_one, u, p): (u, p)
+                           for u, p in tasks}
 
-                with tqdm(total=len(futures), desc="📥 Downloading", unit="file") as pbar:
+                with tqdm(total=len(futures), desc="📥 Downloading", unit="file") as bar:
                     for future in as_completed(futures):
-                        url, path = futures[future]
                         try:
                             if future.result():
-                                successful_downloads += 1
-                        except Exception as e:
-                            print(f"💥 Unexpected error with {url}: {e}")
+                                ok_count += 1
+                        except Exception as exc:
+                            url, _ = futures[future]
+                            print(f"💥 Unexpected error [{url}]: {exc}")
                         finally:
-                            pbar.update(1)
+                            bar.update(1)
+
         except KeyboardInterrupt:
-            print("\n⏹️  Download interrupted by user")
+            print("\n⏹️  Interrupted by user")
             return
 
-        self._print_summary(len(all_files), successful_downloads)
+        self._print_summary(len(tasks), ok_count)
 
-    def _print_summary(self, total_files, successful_downloads):
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
+    def _print_summary(self, total: int, ok: int) -> None:
+        total_bytes = sum(f["size"] for f in self.downloaded_files)
+        print("\n" + "─" * 60)
+        print("📊 SUMMARY")
         print("─" * 60)
-        print("📊 DOWNLOAD SUMMARY")
-        print("─" * 60)
-        print(f"├─ Target: {self.base_url}")
-        print(f"├─ Output: {self.output_dir}")
-        print(f"├─ Total files: {total_files}")
-        print(f"├─ ✅ Successful: {successful_downloads}")
-        print(f"├─ ❌ Failed: {len(self.failed_downloads)}")
-        total_data = sum(f['size'] for f in self.downloaded_files)
-        print(f"└─ 💾 Total data: {self._format_size(total_data)}")
+        print(f"  Target     : {self.base_url}")
+        print(f"  Output dir : {self.output_dir}")
+        print(f"  Total      : {total}")
+        print(f"  ✅ OK      : {ok}")
+        print(f"  ❌ Failed  : {len(self.failed_downloads)}")
+        print(f"  💾 Data    : {format_size(total_bytes)}")
 
         if self.failed_downloads:
-            print(f"\n⚠️  Failed downloads ({len(self.failed_downloads)} total):")
-            for failed in self.failed_downloads:
-                filename = os.path.basename(failed['url'])
-                print(f"   └─ {filename} → {failed['url']}")
+            print(f"\n⚠️  Failed downloads:")
+            for item in self.failed_downloads:
+                print(f"    └─ {os.path.basename(item['url'])}  →  {item['url']}")
+        print("─" * 60)
 
 
-def main():
-    parser = argparse.ArgumentParser(description='SHΔDØW DOWNLOADER v1.1 - WordPress Uploads Mass Downloader')
-    parser.add_argument('url', help='URL of wp-content/uploads/ directory OR single file URL')
-    parser.add_argument('-o', '--output', help='Output directory (default: auto-generated)')
-    parser.add_argument('-t', '--threads', type=int, default=10, help='Number of concurrent downloads (default: 10)')
-    parser.add_argument('--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    parser.add_argument('-st', '--single-target', action='store_true',
-                        help='Single target mode - download only the specified file URL')
-    parser.add_argument('-name', '--filename', help='Custom filename for single target download')
+def _banner(target: str, output: str | None, threads: int) -> None:
+    print("┌─────────────────────────────────────────────────────────┐")
+    print("│             WP Content Upload Downloader v2.0           │")
+    print("│                        by Rbayl                         │")
+    print("└─────────────────────────────────────────────────────────┘")
+    print(f"  🔗 Target  : {target}")
+    if output:
+        print(f"  📁 Output  : {output}")
+    print(f"  🔢 Threads : {threads}")
+    print("─" * 60)
 
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="ShadowDownloader v2.0 — WordPress Uploads Downloader"
+    )
+    p.add_argument("url", help="URL of wp-content/uploads/ directory OR a single file URL")
+    p.add_argument("-o", "--output", help="Output directory (default: auto-generated)")
+    p.add_argument("-t", "--threads", type=int, default=10,
+                   help="Concurrent downloads (default: 10)")
+    p.add_argument("--timeout", type=int, default=30,
+                   help="Request timeout in seconds (default: 30)")
+    p.add_argument("--delay", type=float, default=0.0,
+                   help="Delay between requests in seconds (default: 0)")
+    p.add_argument("-st", "--single-target", action="store_true",
+                   help="Download only the specified URL (single file)")
+    p.add_argument("-name", "--filename",
+                   help="Custom filename for single-target mode")
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
-    try:
-        if args.single_target:
-            setattr(sys.modules['__main__'], 'SINGLE_TARGET_MODE', True)
-        else:
-            setattr(sys.modules['__main__'], 'SINGLE_TARGET_MODE', False)
+    _banner(args.url, args.output, args.threads)
 
-        downloader = ShadowDownloader(
+    try:
+        dl = ShadowDownloader(
             base_url=args.url,
             output_dir=args.output,
             threads=args.threads,
-            timeout=args.timeout
+            timeout=args.timeout,
+            delay=args.delay,
         )
 
         if args.single_target:
-            downloader.download_single_file(args.url, args.filename)
+            dl.download_single(args.url, args.filename)
         else:
-            downloader.download_all_files()
+            dl.download_all()
 
     except KeyboardInterrupt:
-        print(f"\n⏹️  Download interrupted by user")
-    except Exception as e:
-        print(f"💥 Critical error: {e}")
+        print("\n⏹️  Interrupted by user")
+    except Exception as exc:
+        print(f"💥 Fatal error: {exc}")
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
